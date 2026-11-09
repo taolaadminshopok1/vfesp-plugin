@@ -85,28 +85,22 @@ public final class PacketHider extends PacketAdapter {
 
         UUID observerId = observer.getUniqueId();
 
-        // Read the cached verdict. A missing verdict means the entity has not been evaluated
-        // yet; in that case we optimistically allow the packet so that entities never fail to
-        // spawn for legitimate players.
-        Boolean visible = tracker.cachedVisibility(observerId, entityId);
+        // The desired visibility is the authoritative signal. It must not be read from the TTL
+        // cache: an expired cache entry would make every packet pass through again, which
+        // would make the entity flicker into view once per TTL window.
+        Boolean visible = tracker.desiredVisibility(observerId, entityId);
         if (visible == null || visible) {
-            if (visible == Boolean.TRUE && tracker.isHidden(observerId, entityId)) {
-                // The entity became visible again: queue a re-spawn so the client restores it
-                // with full metadata and equipment.
-                tracker.requestRehydration(observerId, entityId);
+            // The entity is visible (or not yet evaluated): let the packet through. When this is
+            // the spawn packet, the client now holds the entity, so the state machine must know
+            // that it has to destroy it later on.
+            if (isSpawnPacket(type)) {
+                tracker.setClientState(observerId, entityId, VisibilityTracker.ClientState.VISIBLE);
             }
             return;
         }
 
         // Hidden: drop the packet entirely. The client never learns the entity's state.
         event.setCancelled(true);
-
-        if (isSpawnPacket(type)) {
-            // The client must not receive the spawn at all, so it never knows the entity.
-            tracker.clearHidden(observerId, entityId);
-        } else {
-            tracker.markHidden(observerId, entityId);
-        }
     }
 
     /**
@@ -129,7 +123,7 @@ public final class PacketHider extends PacketAdapter {
     /**
      * @return {@code true} when the packet type creates a new client-side entity
      */
-    private static boolean isSpawnPacket(PacketType type) {
+    static boolean isSpawnPacket(PacketType type) {
         return type == PacketType.Play.Server.SPAWN_ENTITY;
     }
 
@@ -203,6 +197,6 @@ public final class PacketHider extends PacketAdapter {
      * Removes all bookkeeping for an observer (on disconnect).
      */
     public void forget(UUID observer) {
-        tracker.clearHiddenEntities(observer);
+        tracker.forgetObserverState(observer);
     }
 }

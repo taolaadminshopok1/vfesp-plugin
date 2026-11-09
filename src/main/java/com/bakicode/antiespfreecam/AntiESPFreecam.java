@@ -11,7 +11,6 @@ import com.bakicode.antiespfreecam.freecam.FreecamPacketListener;
 import com.bakicode.antiespfreecam.freecam.FreecamReachCheck;
 import com.comphenix.protocol.ProtocolLibrary;
 import com.comphenix.protocol.ProtocolManager;
-import org.bukkit.Bukkit;
 import org.bukkit.entity.Entity;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
@@ -24,8 +23,6 @@ import org.bukkit.event.player.PlayerChangedWorldEvent;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.scheduler.BukkitTask;
 
-import java.util.ArrayList;
-import java.util.List;
 import java.util.UUID;
 
 /**
@@ -141,6 +138,9 @@ public final class AntiESPFreecam extends JavaPlugin implements Listener {
             return;
         }
 
+        // The chunk snapshot cache is shared between all observers for a single round.
+        tracker.getOcclusion().beginCaptureRound();
+
         for (Player player : getServer().getOnlinePlayers()) {
             if (config.isExempt(player)) {
                 continue;
@@ -165,8 +165,10 @@ public final class AntiESPFreecam extends JavaPlugin implements Listener {
             tracker.evaluate(player);
         }
 
-        // Restore entities that became visible again.
-        rehydrationHandler.processPendingRequests();
+        // Apply the visibility transitions: destroy the entities that are no longer visible and
+        // re-spawn the ones that became visible again. This runs on the main thread because the
+        // native show/hide API requires it.
+        rehydrationHandler.apply();
     }
 
     /**
@@ -174,31 +176,14 @@ public final class AntiESPFreecam extends JavaPlugin implements Listener {
      */
     private void purgeCaches() {
         tracker.getCache().purgeExpired();
+        tracker.pruneStaleEntities();
     }
 
     /**
      * Shows every currently hidden entity to a player.
      */
     private void restoreAll(Player player) {
-        // Drop the native hide bookkeeping and make every tracked entity visible again, so a
-        // plugin reload or shutdown never leaves a client with missing entities.
-        rehydrationHandler.forgetObserver(player.getUniqueId());
-        tracker.clearHiddenEntities(player.getUniqueId());
-
-        org.bukkit.Location location = player.getLocation();
-        org.bukkit.World world = location.getWorld();
-        if (world == null) {
-            return;
-        }
-
-        double radius = config.getAlwaysHiddenDistance();
-        for (Entity entity : world.getNearbyEntities(location, radius, radius, radius)) {
-            try {
-                player.showEntity(this, entity);
-            } catch (Exception ignored) {
-                // The entity may have been despawned in the meantime.
-            }
-        }
+        rehydrationHandler.restoreAll(player);
     }
 
     /* ------------------------------------------------------------------ */
@@ -216,7 +201,6 @@ public final class AntiESPFreecam extends JavaPlugin implements Listener {
     public void onQuit(PlayerQuitEvent event) {
         UUID uuid = event.getPlayer().getUniqueId();
         tracker.removeObserver(uuid);
-        rehydrationHandler.forgetObserver(uuid);
         reachCheck.clearViolations(uuid);
         lineOfSightCheck.clearViolations(uuid);
     }

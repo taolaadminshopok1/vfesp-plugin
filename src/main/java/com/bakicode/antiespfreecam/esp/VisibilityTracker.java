@@ -2,6 +2,7 @@ package com.bakicode.antiespfreecam.esp;
 
 import com.bakicode.antiespfreecam.config.CheatConfig;
 import com.bakicode.antiespfreecam.util.BoundingBoxSampler;
+import com.comphenix.protocol.wrappers.BlockPosition;
 import org.bukkit.Location;
 import org.bukkit.World;
 import org.bukkit.entity.Entity;
@@ -9,11 +10,9 @@ import org.bukkit.entity.LivingEntity;
 import org.bukkit.entity.Player;
 import org.bukkit.util.BoundingBox;
 
-import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -27,14 +26,44 @@ import java.util.concurrent.atomic.AtomicInteger;
  *   <li>The <em>raytrace workers</em> perform the actual occlusion maths against the immutable
  *       snapshots and publish the verdicts into the {@link VisibilityCache}. They never touch
  *       the Bukkit API.</li>
- *   <li>The <em>Netty threads</em> only ever <em>read</em> the cache. They never compute
- *       visibility and never call Bukkit.</li>
+ *   <li>The <em>Netty threads</em> only ever <em>read</em> the cache and the client state. They
+ *       never compute visibility and never call Bukkit.</li>
  * </ul>
  *
  * <p>This split guarantees that no Bukkit API call ever happens off the main thread, while the
  * expensive raytracing still stays off the main thread as required.</p>
  */
 public final class VisibilityTracker {
+
+    /**
+     * The state of an entity as far as a single client is concerned.
+     *
+     * <p>Cancelling packets alone does <em>not</em> hide an entity: the client keeps it in
+     * memory and keeps rendering it. The entity has to be explicitly destroyed and later
+     * re-spawned, and those two operations must be paired correctly or the client ends up with
+     * a broken view of the world.</p>
+     */
+    public enum ClientState {
+        /**
+         * The client has never been told about this entity, or the server has not sent its
+         * spawn packet yet.
+         */
+        UNKNOWN,
+        /**
+         * The client holds the entity and renders it normally.
+         */
+        VISIBLE,
+        /**
+         * The client was told to destroy the entity through the native API and no longer holds
+         * it. Restoring it is done with {@code showEntity}, which emits a complete spawn.
+         */
+        DESTROYED,
+        /**
+         * The client still holds the entity, but its updates are being filtered. Restoring it
+         * requires an explicit spawn packet, because {@code showEntity} would be a no-op.
+         */
+        FILTERED
+    }
 
     /**
      * Immutable snapshot of an entity's spatial state.
@@ -54,6 +83,8 @@ public final class VisibilityTracker {
         public final double headY;
         public final UUID worldId;
         public final boolean player;
+        /** Timestamp of the last main-thread refresh, used to prune stale entries. */
+        public volatile long lastSeen;
 
         EntityState(int entityId, UUID uuid, BoundingBox box, double headY, UUID worldId, boolean player) {
             this.entityId = entityId;
@@ -67,6 +98,7 @@ public final class VisibilityTracker {
             this.headY = headY;
             this.worldId = worldId;
             this.player = player;
+            this.lastSeen = System.currentTimeMillis();
         }
 
         public int getEntityId() {
@@ -85,9 +117,6 @@ public final class VisibilityTracker {
             return worldId;
         }
 
-        /**
-         * @return the horizontal centre of the bounding box
-         */
         public double centerX() {
             return (minX + maxX) * 0.5D;
         }
@@ -134,13 +163,33 @@ public final class VisibilityTracker {
     /** Last evaluation timestamp per pair, used to throttle re-evaluations. */
     private final ConcurrentHashMap<Long, Long> lastTraceTime = new ConcurrentHashMap<>();
 
-    /** Entities the client currently believes are hidden; used to suppress redundant destroys. */
-    private final ConcurrentHashMap<UUID, java.util.Set<Integer>> hiddenEntities = new ConcurrentHashMap<>();
+    /**
+     * The visibility the server currently wants each observer to have for each entity.
+     *
+     * <p>Written by the main thread and by the raytrace workers, read by the main thread when it
+     * applies the visibility transitions.</p>
+     */
+    private final ConcurrentHashMap<UUID, ConcurrentHashMap<Integer, Boolean>> desired =
+            new ConcurrentHashMap<>();
 
-    /** Requests for entities that need to be re-spawned to a client. */
-    private final ConcurrentLinkedQueue<RehydrationRequest> rehydrationQueue = new ConcurrentLinkedQueue<>();
+    /**
+     * The state the client currently believes for each entity.
+     *
+     * <p>Read by the Netty threads to decide whether a packet may be delivered.</p>
+     */
+    private final ConcurrentHashMap<UUID, ConcurrentHashMap<Integer, ClientState>> clientStates =
+            new ConcurrentHashMap<>();
 
     private final AtomicInteger entityCount = new AtomicInteger();
+
+    /**
+     * The entities that were in range during the last evaluation, per observer.
+     *
+     * <p><b>Main thread only.</b> The visibility transition step needs the live Bukkit entity
+     * objects in order to call the native show/hide API, and iterating the world twice per tick
+     * would be wasteful.</p>
+     */
+    private final Map<UUID, java.util.List<Entity>> nearbyCache = new ConcurrentHashMap<>();
 
     public VisibilityTracker(CheatConfig config) {
         this.config = config;
@@ -226,7 +275,9 @@ public final class VisibilityTracker {
         observers.remove(uuid);
         occlusion.removeObserver(uuid);
         cache.invalidateObserver(uuid);
-        hiddenEntities.remove(uuid);
+        desired.remove(uuid);
+        clientStates.remove(uuid);
+        nearbyCache.remove(uuid);
         lastTraceTime.clear();
         pendingTraces.clear();
     }
@@ -237,7 +288,20 @@ public final class VisibilityTracker {
     public void clearEntities() {
         entities.clear();
         cache.clear();
+        desired.clear();
         entityCount.set(0);
+    }
+
+    /**
+     * Removes entity states that have not been refreshed for a while.
+     *
+     * <p>Entities that left the tracking radius would otherwise accumulate in the mirror
+     * forever.</p>
+     */
+    public void pruneStaleEntities() {
+        long threshold = System.currentTimeMillis() - 5_000L;
+        entities.entrySet().removeIf(entry -> entry.getValue().lastSeen < threshold);
+        entityCount.set(entities.size());
     }
 
     /* ------------------------------------------------------------------ */
@@ -268,8 +332,16 @@ public final class VisibilityTracker {
             return;
         }
 
+        ConcurrentHashMap<Integer, Boolean> desiredForObserver =
+                desired.computeIfAbsent(observerId, key -> new ConcurrentHashMap<>());
+
         double maxDistance = config.getAlwaysHiddenDistance();
-        java.util.Collection<Entity> nearby = world.getNearbyEntities(location, maxDistance, maxDistance, maxDistance);
+        double visibleGate = config.getAlwaysVisibleDistance();
+        double visibleGateSq = visibleGate * visibleGate;
+        double maxDistanceSq = maxDistance * maxDistance;
+
+        java.util.Collection<Entity> nearby =
+                world.getNearbyEntities(location, maxDistance, maxDistance, maxDistance);
 
         for (Entity target : nearby) {
             if (target.getEntityId() == observer.getEntityId()) {
@@ -287,20 +359,49 @@ public final class VisibilityTracker {
             }
 
             double distanceSquared = distanceSquared(observerState, state);
-            if (distanceSquared <= config.getAlwaysVisibleDistance() * config.getAlwaysVisibleDistance()) {
-                // Always visible: publish the verdict so the packet layer does not have to
-                // special case it.
+            if (distanceSquared <= visibleGateSq) {
+                // Always visible.
+                desiredForObserver.put(state.entityId, Boolean.TRUE);
                 cache.put(observerId, state.entityId, true);
                 continue;
             }
-            if (distanceSquared >= maxDistance * maxDistance) {
+            if (distanceSquared >= maxDistanceSq) {
                 // Always hidden.
+                desiredForObserver.put(state.entityId, Boolean.FALSE);
                 cache.put(observerId, state.entityId, false);
                 continue;
             }
 
+            // Inside the interesting range. The desired map is the single source of truth: it
+            // keeps the last known verdict until a fresh raytrace replaces it, so the entity
+            // never flickers while the trace is in flight.
+            Boolean previous = desiredForObserver.get(state.entityId);
+            if (previous == null) {
+                // Never evaluated: assume visible until the first raytrace completes, so that
+                // legitimate entities never pop out of existence.
+                desiredForObserver.put(state.entityId, Boolean.TRUE);
+            }
             submitTrace(observerId, observerState, state);
         }
+
+        // Drop entities that are no longer in range.
+        desiredForObserver.keySet().removeIf(entityId -> {
+            EntityState state = entities.get(entityId);
+            if (state == null) {
+                return true;
+            }
+            double distanceSquared = distanceSquared(observerState, state);
+            return distanceSquared >= maxDistanceSq;
+        });
+
+        // Remember the live entities for the transition step.
+        java.util.List<Entity> live = new java.util.ArrayList<>(nearby.size());
+        for (Entity entity : nearby) {
+            if (entity.getEntityId() != observer.getEntityId()) {
+                live.add(entity);
+            }
+        }
+        nearbyCache.put(observerId, live);
     }
 
     /**
@@ -325,6 +426,10 @@ public final class VisibilityTracker {
             try {
                 boolean visible = computeVisibility(observerId, observerState, state);
                 cache.put(observerId, state.entityId, visible);
+                ConcurrentHashMap<Integer, Boolean> desiredForObserver = desired.get(observerId);
+                if (desiredForObserver != null) {
+                    desiredForObserver.put(state.entityId, visible);
+                }
             } finally {
                 pendingTraces.remove(key);
             }
@@ -368,11 +473,8 @@ public final class VisibilityTracker {
 
     /**
      * Determines whether a container (chest / shulker) is visible to the observer.
-     *
-     * <p>Containers are evaluated on the calling thread because the block position is already
-     * known and a single ray trace is cheap.</p>
      */
-    public boolean isContainerVisible(Player observer, com.comphenix.protocol.wrappers.BlockPosition position) {
+    public boolean isContainerVisible(Player observer, BlockPosition position) {
         if (!config.isHideContainers() || position == null) {
             return true;
         }
@@ -406,6 +508,77 @@ public final class VisibilityTracker {
     }
 
     /* ------------------------------------------------------------------ */
+    /* Client state tracking                                               */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Returns the state the client currently believes for an entity.
+     */
+    public ClientState getClientState(UUID observer, int entityId) {
+        ConcurrentHashMap<Integer, ClientState> states = clientStates.get(observer);
+        if (states == null) {
+            return ClientState.UNKNOWN;
+        }
+        ClientState state = states.get(entityId);
+        return state == null ? ClientState.UNKNOWN : state;
+    }
+
+    /**
+     * Records the state the client currently believes for an entity.
+     */
+    public void setClientState(UUID observer, int entityId, ClientState state) {
+        clientStates.computeIfAbsent(observer, key -> new ConcurrentHashMap<>()).put(entityId, state);
+    }
+
+    /**
+     * @return the desired visibility map of an observer
+     */
+    public Map<Integer, Boolean> getDesired(UUID observer) {
+        ConcurrentHashMap<Integer, Boolean> map = desired.get(observer);
+        return map == null ? Map.of() : map;
+    }
+
+    /**
+     * Returns the authoritative desired visibility of a pair.
+     *
+     * <p>Unlike {@link #cachedVisibility(UUID, int)} this never expires: the desired visibility
+     * is the outcome of the last evaluation and stays valid until the next evaluation replaces
+     * it. This is what the packet listener uses, so that a TTL expiry can never make a hidden
+     * entity flicker into view.</p>
+     *
+     * @return {@code true} when the entity should be visible, {@code false} when it should be
+     *         hidden, {@code null} when it has not been evaluated yet
+     */
+    public Boolean desiredVisibility(UUID observer, int entityId) {
+        ConcurrentHashMap<Integer, Boolean> map = desired.get(observer);
+        if (map == null) {
+            return null;
+        }
+        return map.get(entityId);
+    }
+
+    /**
+     * @return the live entities that were in range during the last evaluation
+     */
+    public java.util.List<Entity> getNearbyEntities(UUID observer) {
+        java.util.List<Entity> list = nearbyCache.get(observer);
+        return list == null ? java.util.List.of() : list;
+    }
+
+    /**
+     * Drops the per-observer client state, e.g. after every entity was restored.
+     */
+    public void forgetObserverState(UUID observer) {
+        if (observer == null) {
+            return;
+        }
+        ConcurrentHashMap<Integer, ClientState> states = clientStates.get(observer);
+        if (states != null) {
+            states.clear();
+        }
+    }
+
+    /* ------------------------------------------------------------------ */
     /* Packet thread queries                                               */
     /* ------------------------------------------------------------------ */
 
@@ -434,107 +607,9 @@ public final class VisibilityTracker {
      *
      * <p>Called from the Netty threads. The verdict is <em>only</em> read from the cache: the
      * actual computation happens on the worker pool, so this method never blocks.</p>
-     *
-     * @param observerId the observer's UUID
-     * @param entityId   the target's network id
-     * @return {@code true} when the entity should be visible, {@code false} when it should be
-     *         hidden, and {@code null} when no verdict is cached yet
      */
     public Boolean cachedVisibility(UUID observerId, int entityId) {
         return cache.get(observerId, entityId);
-    }
-
-    /**
-     * Publishes an explicit verdict for a pair.
-     */
-    public void publishVisibility(UUID observerId, int entityId, boolean visible) {
-        cache.put(observerId, entityId, visible);
-    }
-
-    /* ------------------------------------------------------------------ */
-    /* Hidden entity bookkeeping                                           */
-    /* ------------------------------------------------------------------ */
-
-    /**
-     * Records that the client has been told to forget an entity.
-     */
-    public void markHidden(UUID observer, int entityId) {
-        hiddenEntities.computeIfAbsent(observer, key -> ConcurrentHashMap.newKeySet()).add(entityId);
-    }
-
-    /**
-     * @return {@code true} when the client currently believes the entity is hidden
-     */
-    public boolean isHidden(UUID observer, int entityId) {
-        java.util.Set<Integer> ids = hiddenEntities.get(observer);
-        return ids != null && ids.contains(entityId);
-    }
-
-    /**
-     * Clears the hidden marker for an entity.
-     */
-    public void clearHidden(UUID observer, int entityId) {
-        java.util.Set<Integer> ids = hiddenEntities.get(observer);
-        if (ids != null) {
-            ids.remove(entityId);
-        }
-    }
-
-    /**
-     * @return the number of entities currently hidden from the observer
-     */
-    public int hiddenCount(UUID observer) {
-        java.util.Set<Integer> ids = hiddenEntities.get(observer);
-        return ids == null ? 0 : ids.size();
-    }
-
-    /**
-     * Drops every hidden-entity marker belonging to an observer.
-     */
-    public void clearHiddenEntities(UUID observer) {
-        if (observer == null) {
-            return;
-        }
-        hiddenEntities.remove(observer);
-    }
-
-    /* ------------------------------------------------------------------ */
-    /* Rehydration queue                                                   */
-    /* ------------------------------------------------------------------ */
-
-    /**
-     * Queues a request to re-spawn an entity to a client.
-     */
-    public void requestRehydration(UUID observer, int entityId) {
-        rehydrationQueue.add(new RehydrationRequest(observer, entityId));
-    }
-
-    /**
-     * Drains the rehydration queue.
-     */
-    public java.util.List<RehydrationRequest> drainRehydrationRequests() {
-        if (rehydrationQueue.isEmpty()) {
-            return java.util.List.of();
-        }
-        java.util.List<RehydrationRequest> requests = new java.util.ArrayList<>(rehydrationQueue.size());
-        RehydrationRequest request;
-        while ((request = rehydrationQueue.poll()) != null) {
-            requests.add(request);
-        }
-        return requests;
-    }
-
-    /**
-     * A pending re-spawn request.
-     */
-    public static final class RehydrationRequest {
-        public final UUID observer;
-        public final int entityId;
-
-        RehydrationRequest(UUID observer, int entityId) {
-            this.observer = observer;
-            this.entityId = entityId;
-        }
     }
 
     /* ------------------------------------------------------------------ */
@@ -575,8 +650,8 @@ public final class VisibilityTracker {
         occlusion.shutdown();
         entities.clear();
         observers.clear();
-        hiddenEntities.clear();
-        rehydrationQueue.clear();
+        desired.clear();
+        clientStates.clear();
         lastTraceTime.clear();
         pendingTraces.clear();
     }

@@ -1,11 +1,15 @@
 package com.bakicode.antiespfreecam.esp;
 
 import com.bakicode.antiespfreecam.util.BoundingBoxSampler;
+import org.bukkit.Chunk;
+import org.bukkit.ChunkSnapshot;
 import org.bukkit.Location;
+import org.bukkit.Material;
 import org.bukkit.World;
 import org.bukkit.block.Block;
 import org.bukkit.entity.Player;
 
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
@@ -23,15 +27,17 @@ import java.util.concurrent.atomic.AtomicInteger;
  * thread-unsafe world access, the engine works on an immutable snapshot:</p>
  *
  * <ul>
- *   <li>The main thread periodically captures a compact snapshot of the block data around each
- *       observer into a flat {@code byte[]} palette structure.</li>
+ *   <li>The main thread captures a compact snapshot of the block data around each observer into
+ *       a flat {@code byte[]} palette structure, using Bukkit's {@link ChunkSnapshot}.</li>
  *   <li>The packet threads and worker threads trace against that immutable snapshot, which is
  *       safe to read concurrently without any locking.</li>
  * </ul>
  *
- * <p>The snapshot approach also yields far better cache locality than querying
- * {@code World#getBlockAt} per ray step, which is the single biggest performance factor in
- * occlusion systems.</p>
+ * <p>{@link ChunkSnapshot} is the key to making this cheap: it is a true immutable copy of a
+ * chunk's block data that can be read from any thread. Reading a block from it is a plain array
+ * lookup, whereas {@code World#getBlockAt} performs a full chunk lookup plus a world mutation
+ * check on every single call. For a 49x49x33 capture volume that is the difference between
+ * ~79,000 expensive calls and 16 cheap ones.</p>
  */
 public final class OcclusionEngine {
 
@@ -51,12 +57,28 @@ public final class OcclusionEngine {
     private static final int SNAPSHOT_LENGTH = (SNAPSHOT_RADIUS * 2) + 1;
     private static final int SNAPSHOT_VERTICAL = (SNAPSHOT_HEIGHT * 2) + 1;
 
+    /**
+     * Cached classification of every material the engine has already seen.
+     *
+     * <p>Classification involves a handful of string comparisons, so caching it per material
+     * turns the per-block cost into a single hash lookup.</p>
+     */
+    private static final ConcurrentHashMap<Material, Byte> CLASSIFICATION_CACHE = new ConcurrentHashMap<>();
+
     private final VisibilityCache cache;
     private final ExecutorService workers;
     private final AtomicInteger workerCounter = new AtomicInteger();
 
     /** Per-observer snapshots, written by the main thread and read by the packet threads. */
     private final ConcurrentHashMap<UUID, Snapshot> snapshots = new ConcurrentHashMap<>();
+
+    /**
+     * Chunk snapshots shared between all observers during a single capture round.
+     *
+     * <p>Without this, two players standing next to each other would each capture the same
+     * chunks, doubling the cost of the most expensive part of the plugin.</p>
+     */
+    private final ConcurrentHashMap<ChunkKey, ChunkSnapshot> chunkCache = new ConcurrentHashMap<>();
 
     public OcclusionEngine(VisibilityCache cache, int threadCount) {
         this.cache = cache;
@@ -75,6 +97,15 @@ public final class OcclusionEngine {
     /* ------------------------------------------------------------------ */
 
     /**
+     * Starts a new capture round and drops the shared chunk snapshot cache.
+     *
+     * <p><b>Must be called from the main server thread, once per tick.</b></p>
+     */
+    public void beginCaptureRound() {
+        chunkCache.clear();
+    }
+
+    /**
      * Captures a fresh block snapshot around the given observer.
      *
      * <p><b>Must be called from the main server thread.</b></p>
@@ -88,7 +119,7 @@ public final class OcclusionEngine {
         if (world == null) {
             return;
         }
-        snapshots.put(observer.getUniqueId(), Snapshot.capture(observer.getUniqueId(), world, loc));
+        snapshots.put(observer.getUniqueId(), Snapshot.capture(observer.getUniqueId(), world, loc, chunkCache));
     }
 
     /**
@@ -103,6 +134,7 @@ public final class OcclusionEngine {
      */
     public void clearSnapshots() {
         snapshots.clear();
+        chunkCache.clear();
     }
 
     /* ------------------------------------------------------------------ */
@@ -254,6 +286,7 @@ public final class OcclusionEngine {
             Thread.currentThread().interrupt();
         }
         snapshots.clear();
+        chunkCache.clear();
     }
 
     /**
@@ -310,7 +343,8 @@ public final class OcclusionEngine {
          *
          * <p><b>Must be called from the main server thread.</b></p>
          */
-        static Snapshot capture(UUID owner, World world, Location loc) {
+        static Snapshot capture(UUID owner, World world, Location loc,
+                                Map<ChunkKey, ChunkSnapshot> chunkCache) {
             int baseX = loc.getBlockX();
             int baseY = loc.getBlockY();
             int baseZ = loc.getBlockZ();
@@ -324,15 +358,49 @@ public final class OcclusionEngine {
             int index = 0;
             for (int y = 0; y < SNAPSHOT_VERTICAL; y++) {
                 for (int z = 0; z < SNAPSHOT_LENGTH; z++) {
+                    int worldZ = originZ + z;
+                    int chunkZ = worldZ >> 4;
+                    int localZ = worldZ & 15;
+
                     for (int x = 0; x < SNAPSHOT_WIDTH; x++) {
-                        Block block = world.getBlockAt(originX + x, originY + y, originZ + z);
-                        blocks[index++] = classify(block);
+                        int worldX = originX + x;
+                        int chunkX = worldX >> 4;
+                        int localX = worldX & 15;
+
+                        ChunkSnapshot chunk = chunkSnapshot(world, chunkX, chunkZ, chunkCache);
+                        if (chunk == null) {
+                            // The chunk is not loaded: we cannot prove an obstruction here.
+                            blocks[index++] = TRANSPARENT;
+                            continue;
+                        }
+                        Material material = chunk.getBlockType(localX, originY + y, localZ);
+                        blocks[index++] = classify(material);
                     }
                 }
             }
 
             return new Snapshot(owner, world.getUID(), originX, originY, originZ,
                     blocks, System.currentTimeMillis());
+        }
+
+        /**
+         * Obtains the chunk snapshot for the given chunk coordinates, using the shared cache.
+         */
+        private static ChunkSnapshot chunkSnapshot(World world, int chunkX, int chunkZ,
+                                                   Map<ChunkKey, ChunkSnapshot> chunkCache) {
+            ChunkKey key = new ChunkKey(world.getUID(), chunkX, chunkZ);
+            ChunkSnapshot cached = chunkCache.get(key);
+            if (cached != null) {
+                return cached;
+            }
+            if (!world.isChunkLoaded(chunkX, chunkZ)) {
+                return null;
+            }
+            Chunk chunk = world.getChunkAt(chunkX, chunkZ);
+            // includeMaxblocky = false, includeBiome = false: only block data is needed.
+            ChunkSnapshot snapshot = chunk.getChunkSnapshot(false, false, false);
+            chunkCache.put(key, snapshot);
+            return snapshot;
         }
 
         public UUID getOwner() {
@@ -387,25 +455,71 @@ public final class OcclusionEngine {
     }
 
     /**
-     * Classifies a block into the raytracer's opacity categories.
+     * Key identifying a chunk snapshot inside the shared per-round cache.
+     */
+    private static final class ChunkKey {
+        private final UUID worldId;
+        private final int chunkX;
+        private final int chunkZ;
+        private final int hash;
+
+        ChunkKey(UUID worldId, int chunkX, int chunkZ) {
+            this.worldId = worldId;
+            this.chunkX = chunkX;
+            this.chunkZ = chunkZ;
+            this.hash = (31 * (31 * worldId.hashCode() + chunkX)) + chunkZ;
+        }
+
+        @Override
+        public boolean equals(Object other) {
+            if (this == other) {
+                return true;
+            }
+            if (!(other instanceof ChunkKey key)) {
+                return false;
+            }
+            return chunkX == key.chunkX && chunkZ == key.chunkZ && worldId.equals(key.worldId);
+        }
+
+        @Override
+        public int hashCode() {
+            return hash;
+        }
+    }
+
+    /**
+     * Classifies a material into the raytracer's opacity categories.
      *
      * <p>Glass, leaves, fences, iron bars and open doors are treated as {@code SEMI_TRANSPARENT}:
      * they do not count as a solid wall, so an entity behind them stays visible. This mirrors
      * how vanilla renders these blocks and avoids the "entity pops in when standing behind
      * glass" behaviour that would otherwise be an instant cheat tell.</p>
+     *
+     * <p>The result is cached per material, because this runs tens of thousands of times per
+     * tick.</p>
      */
-    private static byte classify(Block block) {
-        if (block == null) {
+    static byte classify(Material material) {
+        if (material == null || material == Material.AIR || material == Material.CAVE_AIR
+                || material == Material.VOID_AIR) {
             return TRANSPARENT;
         }
-        if (block.isEmpty() || block.isLiquid()) {
-            return TRANSPARENT;
+        Byte cached = CLASSIFICATION_CACHE.get(material);
+        if (cached != null) {
+            return cached;
         }
-        if (!block.getType().isSolid()) {
-            return TRANSPARENT;
-        }
+        byte result = computeClassification(material);
+        CLASSIFICATION_CACHE.put(material, result);
+        return result;
+    }
 
-        String name = block.getType().name();
+    /**
+     * Computes the classification of a material without caching it.
+     */
+    private static byte computeClassification(Material material) {
+        if (!material.isSolid()) {
+            return TRANSPARENT;
+        }
+        String name = material.name();
         // Semi transparent families.
         if (name.endsWith("_GLASS") || name.endsWith("_GLASS_PANE") || name.contains("LEAVES")
                 || name.endsWith("FENCE") || name.endsWith("FENCE_GATE") || name.endsWith("WALL")
@@ -420,5 +534,15 @@ public final class OcclusionEngine {
             return SEMI_TRANSPARENT;
         }
         return OPAQUE;
+    }
+
+    /**
+     * Classifies a live block. Retained for callers that hold a {@link Block} reference.
+     */
+    static byte classify(Block block) {
+        if (block == null) {
+            return TRANSPARENT;
+        }
+        return classify(block.getType());
     }
 }

@@ -1,0 +1,62 @@
+# AntiESPFreecam configuration
+#
+# The Anti-ESP engine removes entities and containers from the client's world when the
+# observer has no line of sight to them. Because the client never receives the packets,
+# client-side ESP, tracers, chams and glow have nothing left to render.
+#
+# The Anti-Freecam engine validates every interaction against the player's authoritative
+# server-side position, so a detached camera cannot reach through walls.
+
+esp:
+  # Master switch for the Anti-ESP engine.
+  enabled: true
+  # Hide other players that are not visible.
+  hide-players: true
+  # Hide hostile and passive mobs that are not visible.
+  hide-mobs: true
+  # Hide chests, shulkers and other containers that are not visible.
+  hide-containers: true
+  # Targets at or below this distance (in blocks) are always visible. This preserves the
+  # legitimate "peek around a corner" advantage and avoids pop-in artefacts.
+  always-visible-distance: 2.5
+  # Targets at or beyond this distance (in blocks) are always hidden. This bounds the
+  # raytracing cost and defeats long-range radar ESP.
+  always-hidden-distance: 48.0
+  # Time-to-live of a cached visibility verdict in milliseconds.
+  cache-ttl-millis: 100
+  # Number of dedicated raytrace worker threads. The main thread never raytraces.
+  raytrace-threads: 2
+  # Minimum time between two raytraces of the same observer/target pair, in milliseconds.
+  min-trace-interval-millis: 50
+  # Send an explicit ENTITY_DESTROY packet when an entity becomes hidden, so the client
+  # drops the entity from its memory instead of keeping a stale copy.
+  send-explicit-destroy: true
+  # Maximum number of entities mirrored per observer.
+  max-tracked-entities-per-observer: 512
+
+freecam:
+  # Master switch for the Anti-Freecam engine.
+  enabled: true
+  # Maximum interaction distance in Survival mode, measured from the true server-side eye.
+  survival-reach: 4.5
+  # Maximum interaction distance in Creative and Spectator mode.
+  creative-reach: 5.2
+  # Cancel interactions that are blocked by a solid opaque block.
+  cancel-through-walls: true
+  # Cancel interactions that exceed the maximum reach.
+  cancel-out-of-reach: true
+  # Flag players that trigger a check.
+  flag-on-violation: true
+  # Number of violations before staff are alerted.
+  violation-threshold: 3
+  # Send an alert to staff members holding antiespfreecam.alerts.
+  alert-staff: true
+
+exempt:
+  # Player UUIDs that are exempt from every check.
+  players: []
+  # Permissions that exempt a player from every check.
+  permissions:
+    - antiespfreecam.bypass
+  # Worlds in which the checks are disabled.
+  blocked-worlds: []

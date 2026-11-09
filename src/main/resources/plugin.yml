@@ -1,0 +1,23 @@
+name: AntiESPFreecam
+version: ${project.version}
+main: com.bakicode.antiespfreecam.AntiESPFreecam
+api-version: '1.20'
+author: bakicode
+description: Neutralises client-side ESP and freecam exploitation on Paper/Purpur 1.20.2 - 1.21.x
+depend:
+  - ProtocolLib
+commands:
+  antiespfreecam:
+    description: AntiESPFreecam administration commands.
+    usage: /antiespfreecam <reload|status>
+    permission: antiespfreecam.admin
+permissions:
+  antiespfreecam.admin:
+    description: Allows reloading and inspecting the AntiESPFreecam configuration.
+    default: op
+  antiespfreecam.alerts:
+    description: Receives alerts when a player triggers a freecam check.
+    default: op
+  antiespfreecam.bypass:
+    description: Exempts a player from every AntiESPFreecam check.
+    default: false
